@@ -3,7 +3,7 @@ use strict;
 use Carp;
 
 use vars qw($VERSION);
-$VERSION='1.01';
+$VERSION='1.02';
 
 use IO::Socket;
 use Net::EMI::Common;
@@ -14,10 +14,7 @@ use constant TRUE=>1;
 BEGIN{*logout=*close_link;}
 
 ###########################################################################################################
-sub new {
-   my$self={};
-   bless($self,shift())->_init(@_);
-}
+sub new {bless({},shift())->_init(@_);}
 
 ###########################################################################################################
 # login to SMSC
@@ -31,17 +28,17 @@ sub login {
    # Conditionally open the socket unless already opened.
    $self->open_link() unless(defined($self->{SOCK}));
    unless(defined($self->{SOCK})) {
-      return(wantarray?(undef,0,''):undef);
+      return(defined(wantarray)?wantarray?(undef,0,''):undef:undef);
    }
 
    defined($args{SMSC_ID})&&length($args{SMSC_ID})||do {
       $self->{WARN}&&warn("Missing mandatory parameter 'SMSC_ID' when trying to login. Login failed");
-      return(wantarray?(undef,0,''):undef);
+      return(defined(wantarray)?wantarray?(undef,0,''):undef:undef);
    };
 
    defined($args{SMSC_PW})&&length($args{SMSC_PW})||do {
       $self->{WARN}&&warn("Missing mandatory parameter 'SMSC_PW' when trying to login. Login failed");
-      return(wantarray?(undef,0,''):undef);
+      return(defined(wantarray)?wantarray?(undef,0,''):undef:undef);
    };
 
 	my $data=$args{SMSC_ID}.                                       # OAdC
@@ -68,7 +65,7 @@ sub login {
 	         $self->{OBJ_EMI_COMMON}->UCP_DELIMITER.
 	         '';                                                   # RES1
 
-	my $header=sprintf("%02d",$self->{TRN}++).                     # Transaction counter.
+	my $header=sprintf("%02d",$self->{TRN_OBJ}->next_trn()).       # Transaction counter.
 	           $self->{OBJ_EMI_COMMON}->UCP_DELIMITER.
 	           $self->{OBJ_EMI_COMMON}->data_len($data).           # Length.
 	           $self->{OBJ_EMI_COMMON}->UCP_DELIMITER.
@@ -84,7 +81,8 @@ sub login {
 	                     $self->{OBJ_EMI_COMMON}->UCP_DELIMITER.
 	                     $data.
 	                     $self->{OBJ_EMI_COMMON}->UCP_DELIMITER.
-	                     $checksum);
+	                     $checksum,
+	                     $self->{TIMEOUT_OBJ}->timeout());
 }
 
 #############################################################################################
@@ -111,7 +109,7 @@ sub close_link {
 
    close($self->{SOCK});
    $self->{SOCK}=undef;
-   $self->{TRN}=0;
+   $self->{TRN_OBJ}->reset_trn();
    TRUE;
 }
 
@@ -123,17 +121,27 @@ sub send_sms {
       RECIPIENT=>'',
       MESSAGE_TEXT=>'',
       SENDER_TEXT=>'',
+      TIMEOUT=>undef,
       @_);
+   my$timeout;
+
+   if(defined($args{TIMEOUT})) {
+      my$tv=TimeoutValue->new(TIMEOUT=>$args{TIMEOUT});
+      $timeout=$tv->timeout();
+   }
+   else {
+      $timeout=$self->{TIMEOUT_OBJ}->timeout();
+   }
 
    defined($args{RECIPIENT})&&length($args{RECIPIENT})||do {
       $self->{WARN}&&warn("Missing mandatory parameter 'RECIPIENT' when trying to send message. Transmission failed");
-      return(wantarray?(undef,0,''):undef);
+      return(defined(wantarray)?wantarray?(undef,0,''):undef:undef);
    };
 
 	$args{RECIPIENT}=~s/^\+/00/;
 	$args{RECIPIENT}=~/^\d+$/||do{
 	   $self->{WARN}&&warn("The recipient address contains illegal (non-numerical) characters: $args{RECIPIENT}\nMessage not sent ");
-      return(wantarray?(undef,0,''):undef);
+      return(defined(wantarray)?wantarray?(undef,0,''):undef:undef);
 	};
 
    # It's OK to send an empty message, but not to use undef.
@@ -209,7 +217,7 @@ sub send_sms {
 	         $self->{OBJ_EMI_COMMON}->UCP_DELIMITER.
 	         '';                                             # $RES5;
 
-	my $header=sprintf("%02d",$self->{TRN}++).               # Transaction counter.
+	my $header=sprintf("%02d",$self->{TRN_OBJ}->next_trn()). # Transaction counter.
 	           $self->{OBJ_EMI_COMMON}->UCP_DELIMITER.
 	           $self->{OBJ_EMI_COMMON}->data_len($data).
 	           $self->{OBJ_EMI_COMMON}->UCP_DELIMITER.
@@ -226,7 +234,7 @@ sub send_sms {
 	                                                     $data.
 	                                                     $self->{OBJ_EMI_COMMON}->UCP_DELIMITER);
 
-	$self->_transmit_msg($message_string);
+	$self->_transmit_msg($message_string,$timeout);
 }
 
 ###########################################################################################################
@@ -246,9 +254,13 @@ sub _init {
       SMSC_PORT=>$self->{OBJ_EMI_COMMON}->DEF_SMSC_PORT,
       SENDER_TEXT=>'',
       WARN=>0,
+      TIMEOUT=>undef,
       @_);
 
    $self->{WARN}=defined($args{WARN})?$args{WARN}?1:0:0;
+   $self->{TIMEOUT_OBJ}=TimeoutValue->new(TIMEOUT=>$args{TIMEOUT},
+                                          WARN=>$self->{WARN});
+   $self->{TRN_OBJ}=TranNbr->new();
 
    defined($args{SMSC_HOST})&&length($args{SMSC_HOST})||do{
       $self->{WARN}&&warn("Mandatory entity 'SMSC_HOST' was missing when creating an object of class ".
@@ -274,35 +286,58 @@ sub _init {
    $self->{SENDER_TEXT}=defined($args{SENDER_TEXT})&&length($args{SENDER_TEXT})?$args{SENDER_TEXT}:__PACKAGE__;
 
    $self->{SOCK}=undef;
-   $self->{TRN}=0;         # Transaction number.
+
+   # Some systems have not implemented alarm().
+   # On such systems, calling alarm() will create a run-time error.
+   # Determine if we dare calling alarm() or not.
+   eval{alarm(0)};
+   $self->{CAN_ALARM}=$@?0:1;
+
    $self;
 }
 
 ###########################################################################################################
 # one step in UCP communication
 sub _transmit_msg {
-   my($self,$message_string)=@_;
+   my($self,$message_string,$timeout)=@_;
 	my($rd,$buffer,$response,$acknack,$errcode,$errtxt,$ack);
+
+   defined($timeout)||do{$timeout=0};
 
 	print {$self->{SOCK}} ($self->{OBJ_EMI_COMMON}->STX.$message_string.$self->{OBJ_EMI_COMMON}->ETX) ||do{
 	   $errtxt="Failed to print to SMSC socket. Remote end closed?";
 	   $self->{WARN}&&warn($errtxt);
-	   wantarray?return(undef,0,$errtxt):return;
+	   return(defined(wantarray)?wantarray?(undef,0,$errtxt):undef:undef);
    };
 
 	$self->{SOCK}->flush();
 
 	do	{
-		$rd=read($self->{SOCK},$buffer,1);
+	   # If this system implements alarm(), we will do a non-blocking read.
+	   if($self->{CAN_ALARM}) {
+         eval {
+            $rd=undef;
+   		   local($SIG{ALRM})=sub{die("alarm\n")}; # NB: \n required
+			   alarm($timeout);
+   			$rd=read($self->{SOCK},$buffer,1);
+   			alarm(0);
+       	};
+         # Propagate unexpected errors.
+       	$@&&$@ne"alarm\n"&&die($@);
+	   }
+	   else {
+	      # No alarm() implemented. Must do a (potentially) blocking call to read().
+		   $rd=read($self->{SOCK},$buffer,1);
+	   }
 		defined($rd)||do{ # undef, read error.
 	      $errtxt="Failed to read from SMSC socket. Never received ETX. Remote end closed?";
 	      $self->{WARN}&&warn($errtxt);
-	      wantarray?return(undef,0,$errtxt):return;
+	      return(defined(wantarray)?wantarray?(undef,0,$errtxt):undef:undef);
 	   };
 		$rd||do{ # Zero, end of 'file'.
 	      $errtxt="Never received ETX from SMSC. Remote end closed?";
 	      $self->{WARN}&&warn($errtxt);
-	      wantarray?return(undef,0,$errtxt):return;
+	      return(defined(wantarray)?wantarray?(undef,0,$errtxt):undef:undef);
 	   };
 		$response.=$buffer;
 	}	until($buffer eq $self->{OBJ_EMI_COMMON}->ETX);
@@ -316,7 +351,91 @@ sub _transmit_msg {
 	   $errtxt=~s/^\s+//;
 	   $errtxt=~s/\s+$//;
 	}
-	wantarray?($ack,$errcode,$errtxt):$ack;
+	defined(wantarray)?wantarray?($ack,$errcode,$errtxt):$ack:undef;
+}
+
+###########################################################################################################
+package TimeoutValue;
+use strict;
+use Carp;
+
+use constant MIN_TIMEOUT=>0;           # No timeout at all!
+use constant DEFAULT_TIMEOUT=>15;
+use constant MAX_TIMEOUT=>60;
+
+###########################################################################################################
+sub new {bless({},shift())->_init(@_);}
+
+###########################################################################################################
+sub timeout {$_[0]->{TIMEOUT};}
+
+###########################################################################################################
+sub _init {
+   my$self=shift();
+   my%args=(
+      TIMEOUT=>undef,
+      WARN=>0,
+      @_);
+
+   $self->{WARN}=defined($args{WARN})?$args{WARN}?1:0:0;
+   $self->{TIMEOUT}=DEFAULT_TIMEOUT;
+
+   if(defined($args{TIMEOUT})) {
+      if($args{TIMEOUT}=~/\D/) {
+         $self->{WARN}&&warn("Non-numerical data found in entity 'TIMEOUT' when creating an object of class ".
+                             __PACKAGE__.
+                             '. '.
+                             'Input data: >'.
+                             $args{TIMEOUT}.
+                             '< Given TIMEOUT value ignored and default value '.DEFAULT_TIMEOUT.' used instead');
+         }
+# The commented code will never be executed until we let the MIN_TIMEOUT be greater than zero (since the '-' is non-numeric).
+#      elsif($args{TIMEOUT}<MIN_TIMEOUT) {
+#         $self->{WARN}&&warn("Entity 'TIMEOUT' contains a value smaller than the smallest value allowed (".
+#                             MIN_TIMEOUT.
+#                             ") when creating an object of class ".
+#                             __PACKAGE__.
+#                             '. Given TIMEOUT value ignored and default value '.DEFAULT_TIMEOUT.' used instead');
+#      }
+      elsif($args{TIMEOUT}>MAX_TIMEOUT) {
+         $self->{WARN}&&warn("Entity 'TIMEOUT' contains a value greater than the largest value allowed (".
+                             MAX_TIMEOUT.
+                             ") when creating an object of class ".
+                             __PACKAGE__.
+                             '. Given TIMEOUT value ignored and default value '.DEFAULT_TIMEOUT.' used instead');
+      }
+      else {
+         $self->{TIMEOUT}=$args{TIMEOUT};
+      }
+   }
+
+   $self;
+}
+
+###########################################################################################################
+package TranNbr;
+use strict;
+use constant HIGHEST_NBR=>99;
+
+###########################################################################################################
+sub new {bless({},shift())->_init(@_);}
+
+###########################################################################################################
+sub next_trn {
+   my$self=shift;
+   ($self->{TRN}>HIGHEST_NBR)&&do{$self->{TRN}=0};
+   $self->{TRN}++;
+}
+
+###########################################################################################################
+sub reset_trn {
+   $_[0]->{TRN}=0;
+}
+
+###########################################################################################################
+sub _init {
+   $_[0]->reset_trn();
+   $_[0];
 }
 
 'Choppers rule';
@@ -386,7 +505,7 @@ C<$emi-E<gt>close_link();>
 
 =over 4
 
-=item new( SMSC_HOST=>'smsc.somedomain.tld', SMSC_PORT=>3024, SENDER_TEXT=>'My App', WARN=>1 )
+=item new( SMSC_HOST=>'smsc.somedomain.tld', SMSC_PORT=>3024, SENDER_TEXT=>'My App', TIMEOUT=>10, WARN=>1 )
 
 The parameters may be given in arbitrary order.
 
@@ -397,6 +516,24 @@ C<SMSC_PORT=E<gt>> Optional. The TCP/IP port number of your SMSC. If omitted, po
 C<SENDER_TEXT=E<gt>> Optional. The text that will appear in the receivers mobile phone, identifying you as a sender.
 If omitted, the text 'Net::EMI::Client' will be used by default.
 You will probably want to provide a more meaningful text than that.
+
+C<TIMEOUT=E<gt>> Optional.
+A timeout,
+given in seconds,
+to wait for an acknowledgement of an SMS message transmission.
+The value must be numeric, positive and within the range of B<0> (zero) to B<60>.
+Failing this,
+or if the parameter is omitted,
+the default timeout of 15 seconds will be applied.
+The value of this parameter will be used in all calls to the send_sms() method.
+If the SMSC does not respond with an ACK or a NACK during this period,
+the send_sms() method will return a NACK to the caller.
+If the value of B<0> (zero) is given, no timeout will occur but the send_sms() method will wait B<indefinitively> for a response.
+Note that the value given to the constructor can temporarily be overruled
+in the call to the send_sms() method.
+As a final note, please remember that not all systems have implemented the C<alarm()> call,
+which is used to create a timeout.
+On such systems, this module will still do a blocking call when reading data from the SMSC.
 
 C<WARN=E<gt>> Optional. If this parameter is given and if it evaluates to I<true>,
 then any warnings and errors will be written to C<STDERR>.
@@ -447,14 +584,16 @@ C<SMSC_PW=E<gt>> B<Mandatory>. A valid password at the SMSC.
 
 Any errors detected will be printed on C<STDERR> if the C<WARN=E<gt>> parameter in the constructor evaluates to I<true>.
 
-Return values:
+B<Return values:>
 
-In a scalar context, login() will return I<true> for success, I<false> for transmission failure
+In void context, login() will always return undef.
+
+In scalar context, login() will return I<true> for success, I<false> for transmission failure
 and I<undef> for application related errors.
 Application related errors may be for instance that a mandatory parameter is missing.
 All such errors will be printed on C<STDERR> if the C<WARN=E<gt>> parameter in the constructor evaluates to I<true>.
 
-In an array context, login() will return three values: C<($acknowledge, $error_number, $error_text);>
+In array context, login() will return three values: C<($acknowledge, $error_number, $error_text);>
 where C<$acknowledge> holds the same value as when the method is called in scalar context
 (i.e. I<true>, I<false> or I<undef>),
 C<$error_number> contains a numerical error code from the SMSC and
@@ -466,16 +605,17 @@ which means that the data quality of these entities depends on how well the SMSC
 If C<$acknowledge> is I<undef>, then C<$error_number> will be set to 0 (zero) and C<$error_text> will
 contain a zero length string.
 
-It is B<strongly> recommended to call login() in an array context, since this provides for an improved error handling
+It is B<strongly recommended to call login() in an array context>, since this provides for an improved error handling
 in the main application.
 
-=item send_sms( RECIPIENT=>'9999999999', MESSAGE_TEXT=>'A Message', SENDER_TEXT=>'Some text' )
+=item send_sms( RECIPIENT=>'9999999999', MESSAGE_TEXT=>'A Message', SENDER_TEXT=>'Some text', TIMEOUT=>5 )
 
 Submits the SMS message to the SMSC (Operation 51) and waits for an SMSC acknowledge.
 
 The parameters may be given in arbitrary order.
 
-C<RECIPIENT=E<gt>> B<Mandatory>. This is the phone number of the recipient in international format with leading + or 00.
+C<RECIPIENT=E<gt>> B<Mandatory>.
+This is the phone number of the recipient in international format with leading a '+' or '00'.
 
 C<MESSAGE_TEXT=E<gt>> Optional. A text message to be transmitted.
 It is accepted to transfer an empty message,
@@ -485,16 +625,33 @@ C<SENDER_TEXT=E<gt>> Optional. The text that will appear in the receivers mobile
 This text will B<temporarily> replace the text given to the constructor.
 If omitted, the text already given to the constructor will be used.
 
+C<TIMEOUT=E<gt>> Optional.
+A timeout,
+given in seconds,
+to wait for an acknowledgement of this SMS message transmission.
+The value must be numeric, positive and within the range of B<0> (zero) to B<60>.
+Failing this,
+or if the parameter is omitted,
+the timeout established in the new() constructor will be applied.
+If the SMSC does not respond with an ACK or a NACK during this period,
+the send_sms() method will return a NACK to the caller.
+If the value of B<0> (zero) is given, no timeout will occur but the send_sms() method will wait B<indefinitively> for a response.
+On a system that has not implemented the C<alarm()> call,
+which is used to create a timeout,
+this module will still do a blocking call when reading data from the SMSC.
+
 Any errors detected will be printed on C<STDERR> if the C<WARN=E<gt>> parameter in the constructor evaluates to I<true>.
 
-Return values:
+B<Return values:>
 
-In a scalar context, send_sms() will return I<true> for success, I<false> for transmission failure
+In void context, send_sms() will always return undef.
+
+In scalar context, send_sms() will return I<true> for success, I<false> for transmission failure
 and I<undef> for application related errors.
 Application related errors may be for instance that a mandatory parameter is missing.
 All such errors will be printed on C<STDERR> if the C<WARN=E<gt>> parameter in the constructor evaluates to I<true>.
 
-In an array context, send_sms() will return the three values: C<($acknowledge, $error_number, $error_text);>
+In array context, send_sms() will return the three values: C<($acknowledge, $error_number, $error_text);>
 where C<$acknowledge> holds the same value as when the method is called in scalar context
 (i.e. I<true>, I<false> or I<undef>),
 C<$error_number> contains a numerical error code from the SMSC and
@@ -506,12 +663,35 @@ which means that the data quality of these entities depends on how well the SMSC
 If C<$acknowledge> is I<undef>, then C<$error_number> will be set to 0 (zero) and C<$error_text> will
 contain a zero length string.
 
-It is B<strongly> recommended to call send_sms() in an array context, since this provides for an improved error handling
-in the main application.
+It is B<strongly recommended to call send_sms() in array context>,
+since this provides for an improved error handling in the main application.
 
 B<Note!>
 The fact that the message was successfully transmitted to the SMSC does B<not>
 guarantee immediate delivery to the recipient or in fact any delivery at all.
+
+B<About the timeout.>
+Not all Perl systems are able to provide the timeout.
+The timeout is internally implemented with the alarm() call.
+If your system has implemented alarm(),
+then any timeout value provided will be honored.
+If not, you may provide any value you wish for the timeout,
+it will still be ignored and reading the ACK from the SMSC will block until everything is read.
+If the SMSC fails to send you the full response B<your application will freeze>.
+If your system B<does> implement alarm() but you do B<not> provide any timeout value,
+then the default timeout of 15 seconds will be applied.
+
+You may test this on your own system by executing the following on a command line:
+
+C<perl -e "alarm(0)">
+
+If the response is that alarm() is not implemented, then you're out of luck.
+You can still use the module, but in case the SMSC doesn't respond as expected
+your application will wait B<indefinitively>.
+
+Still, the author uses this module in a production environment without alarm(),
+and thereby without any timeout whatsoever,
+and has still not had any timeout related problem.
 
 =item logout()
 
@@ -546,6 +726,13 @@ L<Net::EMI::Common>
 =head1 AUTHOR
 
 Gustav Schaffter E<lt>schaffter_cpan@hotmail.comE<gt>
+
+=head1 DISCLAIMER
+
+If you find any bugs in this Perl module,
+or if it does not provide what you would want it to,
+then you're entitled a refund of all the money you've sent me.
+Nothing more.
 
 =head1 ACKNOWLEDGMENTS
 

@@ -6,3 +6,11 @@ Revision history for Perl extension Net::EMI::Client.
 1.01  25-Feb-2003
       - Updated the Makefile.PL file to reflect module dependencies.
 
+1.02  14-May-2003
+      - Made sure the transaction counter, which can hold no more than two digits,
+        will never go beyond 99.
+      - Introduced a timeout while waiting for a ACK/NACK response from the SMSC.
+        Note, that the timeout depends on the alarm() function, which unfortunately
+        is not implemented on all systems.
+      - Made sure that when methods are called in void context, they will return undef.
+
