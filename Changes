@@ -3,3 +3,6 @@ Revision history for Perl extension Net::EMI::Client.
 1.00  24-Feb-2003
 	   - First release of this module.
 
+1.01  25-Feb-2003
+      - Updated the Makefile.PL file to reflect module dependencies.
+

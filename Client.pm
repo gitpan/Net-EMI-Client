@@ -1,14 +1,9 @@
 package Net::EMI::Client;
 use strict;
 use Carp;
-#
-# Copyright (c) 2003 Gustav Schaffter.
-# All rights reserved.
-# This program is free software; you can redistribute it and/or
-# modify it under the same terms as Perl itself.
 
 use vars qw($VERSION);
-$VERSION='1.0';
+$VERSION='1.01';
 
 use IO::Socket;
 use Net::EMI::Common;
